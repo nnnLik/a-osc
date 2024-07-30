@@ -1,5 +1,7 @@
 import argparse
 import logging
+import time
+
 import mysql.connector
 
 logging.basicConfig(
@@ -49,6 +51,7 @@ class MigrateService:
         self.audit_table_name = f'_{self.table}_audit'
         self.shadow_table_name = f"_{self.table}_new"
         self.temp_table = 'temp_copied_ids'
+        self.s_time = time.perf_counter()
 
     def _create_audit_table(self):
         logger.info('Creating audit table...')
@@ -194,6 +197,7 @@ class MigrateService:
             self.cursor.close()
             self.cnx.close()
             logger.info('Database connection closed.')
+            logger.info(f'Spend {round(time.perf_counter() - self.s_time, 3)}')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Admitad Online Schema Change Tool')
