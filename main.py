@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import time
 
@@ -53,6 +54,14 @@ class MigrateService:
         self.temp_table = 'temp_copied_ids'
         self.s_time = time.perf_counter()
 
+    def _get_table_columns(self) -> list[str]:
+        self.cursor.execute(f"""
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = '{self.table}' AND TABLE_SCHEMA = '{self.database}'
+        """)
+        return [col[0] for col in self.cursor.fetchall()]
+
     def _create_audit_table(self):
         logger.info('Creating audit table...')
         self.cursor.execute(f"""
@@ -68,25 +77,42 @@ class MigrateService:
 
     def _add_triggers(self):
         logger.info('Creating triggers...')
+        
+        columns = self._get_table_columns()
+        set_columns = ', '.join([f"'{col}', NEW.{col}" for col in columns])
+        old_set_columns = ', '.join([f"'{col}', OLD.{col}" for col in columns]) 
+
         self.cursor.execute(f"""
             CREATE TRIGGER {self.table}_insert AFTER INSERT ON {self.table}
             FOR EACH ROW
             INSERT INTO {self.audit_table_name} (action, original_id, row_data) 
-            VALUES ('INSERT', NEW.id, JSON_OBJECT('new', ROW_TO_JSON(NEW)));
+            VALUES (
+                'INSERT',
+                NEW.id,
+                JSON_OBJECT({set_columns})
+            );
         """)
-        
+
         self.cursor.execute(f"""
             CREATE TRIGGER {self.table}_update AFTER UPDATE ON {self.table}
             FOR EACH ROW
             INSERT INTO {self.audit_table_name} (action, original_id, row_data) 
-            VALUES ('UPDATE', OLD.id, JSON_OBJECT('old', ROW_TO_JSON(OLD), 'new', ROW_TO_JSON(NEW)));
+            VALUES (
+                'UPDATE',
+                OLD.id,
+                JSON_OBJECT({set_columns})
+            );
         """)
-        
+
         self.cursor.execute(f"""
             CREATE TRIGGER {self.table}_delete AFTER DELETE ON {self.table}
             FOR EACH ROW
             INSERT INTO {self.audit_table_name} (action, original_id, row_data) 
-            VALUES ('DELETE', OLD.id, JSON_OBJECT('old', ROW_TO_JSON(OLD)));
+            VALUES (
+                'DELETE',
+                OLD.id,
+                JSON_OBJECT('old', JSON_OBJECT({old_set_columns}))
+            );
         """)
         
         logger.info(f"Triggers for table {self.table} created.")
@@ -129,20 +155,32 @@ class MigrateService:
             current_id = end_id + 1
             
             logger.info(f"Copied rows from ID {current_id - self.chunk_size} to {end_id}...")
+
         logger.info('Data copied successfully to the shadow table.')
 
     def _replay_audit_logs(self):
         logger.info('Replaying audit logs...')
+
         self.cursor.execute(f"SELECT * FROM {self.audit_table_name}")
         audit_logs = self.cursor.fetchall()
+        columns = self._get_table_columns()
+        
         
         for log in audit_logs:
-            action, original_id, row_data = log[1], log[2], log[3]
+            action, original_id, row_data = log[1], log[2], json.loads(log[3])
             if action == 'INSERT':
                 self.cursor.execute(f"INSERT INTO {self.shadow_table_name} SELECT * FROM {self.table} WHERE id = {original_id}")
             elif action == 'UPDATE':
-                old_row, new_row = row_data['old'], row_data['new']
-                # TODO: а вот хз
+                columns_str = ', '.join(columns)
+                new_values_str = ', '.join([f"'{row_data.get(col, '')}'" for col in columns])
+                update_str = ', '.join([f"{col} = VALUES({col})" for col in columns if col != 'id'])
+                
+                insert_query = f"""
+                    INSERT INTO {self.shadow_table_name} ({columns_str})
+                    VALUES ({new_values_str})
+                    ON DUPLICATE KEY UPDATE {update_str}
+                """
+                self.cursor.execute(insert_query)
             elif action == 'DELETE':
                 self.cursor.execute(f"DELETE FROM {self.shadow_table_name} WHERE id = {original_id}")
             self.cursor.execute(f"DELETE FROM {self.audit_table_name} WHERE id = {log[0]}")
@@ -171,7 +209,7 @@ class MigrateService:
         self.cursor.execute(f"DROP TABLE {self.audit_table_name}")
         logger.info(f"Audit table {self.audit_table_name} dropped.")
     
-    def execute(self) -> None:
+    def execute(self) -> None:        
         try:
             self._create_audit_table()
             self._add_triggers()
@@ -181,10 +219,12 @@ class MigrateService:
             if self.swap_tables:
                 self._swap_tables()
             if self.drop_triggers:
+                logger.info('dropped triggers')
                 self._drop_triggers()
             if self.swap_tables and self.drop_old_table:
                 self._drop_old_table()
             if self.audit_table_name:
+                logger.info('dropped audit')
                 self._drop_audit_table()
             # TODO: is new table is similar to old
             # TODO: index?
@@ -208,13 +248,14 @@ if __name__ == "__main__":
     parser.add_argument('--alter', required=True, help='Alter command to apply to the new table')
     parser.add_argument('--user', required=True, help='MySQL user')
     parser.add_argument('--password', required=True, help='MySQL password')
-    parser.add_argument('--chunk-size', required=True, dest='chunk_size', help='Copy chunk size')
-    parser.add_argument('--swap-tables', action='store_true', help='Swap tables after migration')
-    parser.add_argument('--drop-old-table', action='store_true', help='Drop old table after swapping')
-    parser.add_argument('--drop-triggers', action='store_true', help='Drop triggers after migration')
-    parser.add_argument('--drop-audit-table', action='store_true', help='Drop audit table after migration')
+    parser.add_argument('--chunk-size', type=int, required=True, dest='chunk_size', default=1000, help='Copy chunk size')
+    parser.add_argument('--swap-tables', action='store_true', default=False, help='Swap tables after migration')
+    parser.add_argument('--drop-old-table', action='store_true', default=False, help='Drop old table after swapping')
+    parser.add_argument('--drop-triggers', action='store_true', default= False, help='Drop triggers after migration')
+    parser.add_argument('--drop-audit-table', action='store_true', default=False, help='Drop audit table after migration')
     
     args = parser.parse_args()
+    logger.info(args)
     
     service = MigrateService(
         host=args.host,
