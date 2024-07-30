@@ -4,6 +4,8 @@ import logging
 import time
 
 import mysql.connector
+from mysql.connector.pooling import PooledMySQLConnection
+from mysql.connector.abstracts import MySQLConnectionAbstract, MySQLCursorAbstract
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,20 +33,20 @@ class MigrateService:
         drop_old_table: bool,
         drop_triggers: bool,
         drop_audit_table: bool,
-    ):
-        self.host = host
-        self.port = port
-        self.username = username
-        self.password = password
-        self.database = database
-        self.table = table
-        self.alter = alter
-        self.chunk_size = chunk_size
-        self.swap_tables = swap_tables
-        self.drop_old_table = drop_old_table
-        self.drop_triggers = drop_triggers
-        self.drop_audit_table = drop_audit_table
-        self.cnx = mysql.connector.connect(
+    ) -> None:
+        self.host: str = host
+        self.port: int = port
+        self.username: str = username
+        self.password: str = password
+        self.database: str = database
+        self.table: str = table
+        self.alter: list[str] = alter
+        self.chunk_size: int = chunk_size
+        self.swap_tables: bool = swap_tables
+        self.drop_old_table: bool = drop_old_table
+        self.drop_triggers: bool = drop_triggers
+        self.drop_audit_table: bool = drop_audit_table
+        self.cnx: PooledMySQLConnection | MySQLConnectionAbstract = mysql.connector.connect(
             user=self.username,
             password=self.password,
             host=self.host,
@@ -52,11 +54,11 @@ class MigrateService:
             database=self.database,
             autocommit=True,
         )
-        self.cursor = self.cnx.cursor()
-        self.audit_table_name = f'_{self.table}_audit'
-        self.shadow_table_name = f"_{self.table}_new"
-        self.temp_table = 'temp_copied_ids'
-        self.s_time = time.perf_counter()
+        self.cursor: MySQLCursorAbstract = self.cnx.cursor()
+        self.audit_table_name: str = f'_{self.table}_audit'
+        self.shadow_table_name: str = f"_{self.table}_new"
+        self.temp_table: str = 'temp_copied_ids'
+        self.s_time: float = time.perf_counter()
 
     def _get_table_columns(self) -> list[str]:
         self.cursor.execute(f"""
@@ -66,7 +68,7 @@ class MigrateService:
         """)
         return [col[0] for col in self.cursor.fetchall()]
 
-    def _create_audit_table(self):
+    def _create_audit_table(self) -> None:
         logger.info('Creating audit table...')
         self.cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.audit_table_name} (
@@ -79,7 +81,7 @@ class MigrateService:
         """)
         logger.info(f"Audit table {self.audit_table_name} created.")
 
-    def _add_triggers(self):
+    def _add_triggers(self) -> None:
         logger.info('Creating triggers...')
         
         columns = self._get_table_columns()
@@ -121,22 +123,24 @@ class MigrateService:
         
         logger.info(f"Triggers for table {self.table} created.")
 
-    def _create_shadow_table(self):
+    def _create_shadow_table(self) -> None:
         logger.info('Creating shadow table...')
+
         self.cursor.execute(f"CREATE TABLE {self.shadow_table_name} LIKE {self.table}")
         for alter_command in self.alter:
             self.cursor.execute(f"ALTER TABLE {self.shadow_table_name} {alter_command}")
+
         logger.info(f"Shadow table {self.shadow_table_name} created and altered.")
 
-    def _copy_data(self):
+    def _copy_data(self) -> None:
         logger.info('Copying data to shadow table...')
         
-        self.cursor.execute(f"CREATE TEMPORARY TABLE {self.temp_table} (id INT unsigned PRIMARY KEY)")
+        # self.cursor.execute(f"CREATE TEMPORARY TABLE {self.temp_table} (id INT unsigned PRIMARY KEY)")
         
         self.cursor.execute(f"SELECT MIN(id), MAX(id) FROM {self.table}")
         min_id, max_id = self.cursor.fetchone()
         
-        if min_id is None or max_id is None:
+        if not min_id or not max_id:
             logger.info("No data found in the source table.")
             return
 
@@ -144,17 +148,17 @@ class MigrateService:
         
         current_id = min_id
         while current_id <= max_id:
-            end_id = min(current_id + self.chunk_size - 1, max_id)
+            end_id: int = min(current_id + self.chunk_size - 1, max_id)
             self.cursor.execute(f"""
                 INSERT INTO {self.shadow_table_name} 
                 SELECT * FROM {self.table}
                 WHERE id BETWEEN {current_id} AND {end_id}
             """)
-            self.cursor.execute(f"""
-                INSERT IGNORE INTO {self.temp_table} 
-                SELECT id FROM {self.table}
-                WHERE id BETWEEN {current_id} AND {end_id}
-            """)
+            # self.cursor.execute(f"""
+            #     INSERT IGNORE INTO {self.temp_table} 
+            #     SELECT id FROM {self.table}
+            #     WHERE id BETWEEN {current_id} AND {end_id}
+            # """)
             
             current_id = end_id + 1
             
@@ -162,7 +166,7 @@ class MigrateService:
 
         logger.info('Data copied successfully to the shadow table.')
 
-    def _replay_audit_logs(self):
+    def _replay_audit_logs(self) -> None:
         logger.info('Replaying audit logs...')
 
         self.cursor.execute(f"SELECT * FROM {self.audit_table_name}")
@@ -191,24 +195,24 @@ class MigrateService:
         
         logger.info(f"Audit logs replayed and applied to {self.shadow_table_name}.")
 
-    def _swap_tables(self):
+    def _swap_tables(self) -> None:
         logger.info('Swapping tables...')
         self.cursor.execute(f"RENAME TABLE {self.table} TO {self.table}_old, {self.shadow_table_name} TO {self.table}")
         logger.info(f"Tables swapped: {self.table} with {self.shadow_table_name}.")
 
-    def _drop_old_table(self):
+    def _drop_old_table(self) -> None:
         logger.info('Dropping old table...')
         self.cursor.execute(f"DROP TABLE {self.table}_old")
         logger.info(f"Old table {self.table}_old dropped.")
 
-    def _drop_triggers(self):
+    def _drop_triggers(self) -> None:
         logger.info('Dropping triggers...')
         self.cursor.execute(f"DROP TRIGGER IF EXISTS {self.table}_insert")
         self.cursor.execute(f"DROP TRIGGER IF EXISTS {self.table}_update")
         self.cursor.execute(f"DROP TRIGGER IF EXISTS {self.table}_delete")
         logger.info(f"Triggers for table {self.table} dropped.")
     
-    def _drop_audit_table(self):
+    def _drop_audit_table(self) -> None:
         logger.info('Dropping audit table...')
         self.cursor.execute(f"DROP TABLE {self.audit_table_name}")
         logger.info(f"Audit table {self.audit_table_name} dropped.")
