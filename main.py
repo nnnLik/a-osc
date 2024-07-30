@@ -101,7 +101,7 @@ class MigrateService:
     def _copy_data(self):
         logger.info('Copying data to shadow table...')
         
-        self.cursor.execute(f"CREATE TEMPORARY TABLE {self.temp_table} (id UNSIGNED INT PRIMARY KEY)")
+        self.cursor.execute(f"CREATE TEMPORARY TABLE {self.temp_table} (id INT unsigned PRIMARY KEY)")
         
         self.cursor.execute(f"SELECT MIN(id), MAX(id) FROM {self.table}")
         min_id, max_id = self.cursor.fetchone()
