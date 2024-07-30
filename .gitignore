@@ -1,0 +1,5 @@
+venv/
+docker/
+docker-compose*
+entrypoint.sh
+fill.py
