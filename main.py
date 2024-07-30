@@ -1,6 +1,13 @@
 import argparse
+import logging
 import mysql.connector
-import time
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger()
+
 
 class MigrateService:
     def __init__(
@@ -42,29 +49,8 @@ class MigrateService:
         self.audit_table_name = f'_{self.table}_audit'
         self.shadow_table_name = f"_{self.table}_new"
 
-    def execute(self) -> None:
-        try:
-            self._create_audit_table()
-            self._add_triggers()
-            self._create_shadow_table()
-            self._copy_data()
-            self._replay_audit_logs()
-            if self.swap_tables:
-                self._swap_tables()
-            if self.drop_triggers:
-                self._drop_triggers()
-            if self.swap_tables and self.drop_old_table:
-                self._drop_old_table()
-            if self.audit_table_name:
-                self._drop_audit_table()
-            print("Migration completed successfully.")
-        except mysql.connector.Error as err:
-            print(f"Error: {err}")
-        finally:
-            self.cursor.close()
-            self.cnx.close()
-
     def _create_audit_table(self):
+        logger.info('Creating audit table...')
         self.cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.audit_table_name} (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -74,9 +60,10 @@ class MigrateService:
                 action_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        print(f"Audit table {self.audit_table_name} created.")
+        logger.info(f"Audit table {self.audit_table_name} created.")
 
     def _add_triggers(self):
+        logger.info('Creating triggers...')
         self.cursor.execute(f"""
             CREATE TRIGGER {self.table}_insert AFTER INSERT ON {self.table}
             FOR EACH ROW
@@ -98,15 +85,21 @@ class MigrateService:
             VALUES ('DELETE', OLD.id, JSON_OBJECT('old', ROW_TO_JSON(OLD)));
         """)
         
-        print(f"Triggers for table {self.table} created.")
+        logger.info(f"Triggers for table {self.table} created.")
 
     def _create_shadow_table(self):
+        logger.info('Creating shadow table...')
         self.cursor.execute(f"CREATE TABLE {self.shadow_table_name} LIKE {self.table}")
         for alter_command in self.alter:
             self.cursor.execute(f"ALTER TABLE {self.shadow_table_name} {alter_command}")
-        print(f"Shadow table {self.shadow_table_name} created and altered.")
+        logger.info(f"Shadow table {self.shadow_table_name} created and altered.")
 
     def _copy_data(self):
+        self.cursor.execute(f"SHOW TABLE STATUS LIKE '{self.table}'")
+        status = self.cursor.fetchone()
+        row_count_estimate = status[4]
+        logger.info(f"Estimated row count: {row_count_estimate}")
+        logger.info('Copying data to shadow table...')
         offset = 0
         while True:
             self.cursor.execute(f"INSERT INTO {self.shadow_table_name} SELECT * FROM {self.table} LIMIT {self.chunk_size} OFFSET {offset}")
@@ -114,10 +107,10 @@ class MigrateService:
             if rows == 0:
                 break
             offset += self.chunk_size
-            print(f"Copied {offset} rows...")
-            # time.sleep()
+            logger.info(f"Copied {offset} rows...")
 
     def _replay_audit_logs(self):
+        logger.info('Replaying audit logs...')
         self.cursor.execute(f"SELECT * FROM {self.audit_table_name}")
         audit_logs = self.cursor.fetchall()
         
@@ -127,31 +120,57 @@ class MigrateService:
                 self.cursor.execute(f"INSERT INTO {self.shadow_table_name} SELECT * FROM {self.table} WHERE id = {original_id}")
             elif action == 'UPDATE':
                 old_row, new_row = row_data['old'], row_data['new']
-                self.cursor.execute(f"UPDATE {self.shadow_table_name} SET ... WHERE id = {original_id}")
+                # TODO: а вот хз
             elif action == 'DELETE':
                 self.cursor.execute(f"DELETE FROM {self.shadow_table_name} WHERE id = {original_id}")
             self.cursor.execute(f"DELETE FROM {self.audit_table_name} WHERE id = {log[0]}")
         
-        print(f"Audit logs replayed and applied to {self.shadow_table_name}.")
+        logger.info(f"Audit logs replayed and applied to {self.shadow_table_name}.")
 
     def _swap_tables(self):
+        logger.info('Swapping tables...')
         self.cursor.execute(f"RENAME TABLE {self.table} TO {self.table}_old, {self.shadow_table_name} TO {self.table}")
-        print(f"Tables swapped: {self.table} with {self.shadow_table_name}.")
+        logger.info(f"Tables swapped: {self.table} with {self.shadow_table_name}.")
 
     def _drop_old_table(self):
+        logger.info('Dropping old table...')
         self.cursor.execute(f"DROP TABLE {self.table}_old")
-        print(f"Old table {self.table}_old dropped.")
+        logger.info(f"Old table {self.table}_old dropped.")
 
     def _drop_triggers(self):
+        logger.info('Dropping triggers...')
         self.cursor.execute(f"DROP TRIGGER IF EXISTS {self.table}_insert")
         self.cursor.execute(f"DROP TRIGGER IF EXISTS {self.table}_update")
         self.cursor.execute(f"DROP TRIGGER IF EXISTS {self.table}_delete")
-        print(f"Triggers for table {self.table} dropped.")
+        logger.info(f"Triggers for table {self.table} dropped.")
     
     def _drop_audit_table(self):
+        logger.info('Dropping audit table...')
         self.cursor.execute(f"DROP TABLE {self.audit_table_name}")
-        print(f"Audit table {self.audit_table_name} dropped.")
-
+        logger.info(f"Audit table {self.audit_table_name} dropped.")
+    
+    def execute(self) -> None:
+        try:
+            self._create_audit_table()
+            self._add_triggers()
+            self._create_shadow_table()
+            self._copy_data()
+            self._replay_audit_logs()
+            if self.swap_tables:
+                self._swap_tables()
+            if self.drop_triggers:
+                self._drop_triggers()
+            if self.swap_tables and self.drop_old_table:
+                self._drop_old_table()
+            if self.audit_table_name:
+                self._drop_audit_table()
+            logger.info("Migration completed successfully.")
+        except mysql.connector.Error as err:
+            logger.error(f"Error: {err}", exc_info=True)
+        finally:
+            self.cursor.close()
+            self.cnx.close()
+            logger.info('Database connection closed.')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Admitad Online Schema Change Tool')
