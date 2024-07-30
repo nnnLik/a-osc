@@ -48,6 +48,7 @@ class MigrateService:
         self.cursor = self.cnx.cursor()
         self.audit_table_name = f'_{self.table}_audit'
         self.shadow_table_name = f"_{self.table}_new"
+        self.temp_table = 'temp_copied_ids'
 
     def _create_audit_table(self):
         logger.info('Creating audit table...')
@@ -95,19 +96,37 @@ class MigrateService:
         logger.info(f"Shadow table {self.shadow_table_name} created and altered.")
 
     def _copy_data(self):
-        self.cursor.execute(f"SHOW TABLE STATUS LIKE '{self.table}'")
-        status = self.cursor.fetchone()
-        row_count_estimate = status[4]
-        logger.info(f"Estimated row count: {row_count_estimate}")
         logger.info('Copying data to shadow table...')
-        offset = 0
-        while True:
-            self.cursor.execute(f"INSERT INTO {self.shadow_table_name} SELECT * FROM {self.table} LIMIT {self.chunk_size} OFFSET {offset}")
-            rows = self.cursor.rowcount
-            if rows == 0:
-                break
-            offset += self.chunk_size
-            logger.info(f"Copied {offset} rows...")
+        
+        self.cursor.execute(f"CREATE TEMPORARY TABLE {self.temp_table} (id UNSIGNED INT PRIMARY KEY)")
+        
+        self.cursor.execute(f"SELECT MIN(id), MAX(id) FROM {self.table}")
+        min_id, max_id = self.cursor.fetchone()
+        
+        if min_id is None or max_id is None:
+            logger.info("No data found in the source table.")
+            return
+
+        logger.info(f"Copying data from ID {min_id} to {max_id}")
+        
+        current_id = min_id
+        while current_id <= max_id:
+            end_id = min(current_id + self.chunk_size - 1, max_id)
+            self.cursor.execute(f"""
+                INSERT INTO {self.shadow_table_name} 
+                SELECT * FROM {self.table}
+                WHERE id BETWEEN {current_id} AND {end_id}
+            """)
+            self.cursor.execute(f"""
+                INSERT IGNORE INTO {self.temp_table} 
+                SELECT id FROM {self.table}
+                WHERE id BETWEEN {current_id} AND {end_id}
+            """)
+            
+            current_id = end_id + 1
+            
+            logger.info(f"Copied rows from ID {current_id - self.chunk_size} to {end_id}...")
+        logger.info('Data copied successfully to the shadow table.')
 
     def _replay_audit_logs(self):
         logger.info('Replaying audit logs...')
@@ -164,6 +183,10 @@ class MigrateService:
                 self._drop_old_table()
             if self.audit_table_name:
                 self._drop_audit_table()
+            # TODO: is new table is similar to old
+            # TODO: index?
+            # TODO: drop temp table
+            # TODO: resume by temp table data
             logger.info("Migration completed successfully.")
         except mysql.connector.Error as err:
             logger.error(f"Error: {err}", exc_info=True)
