@@ -3,3 +3,4 @@ docker/
 docker-compose*
 entrypoint.sh
 fill.py
+*.log
